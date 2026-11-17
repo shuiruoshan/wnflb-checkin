@@ -388,16 +388,30 @@ def get_ocr():
     return _OCR_INSTANCE
 
 
-def solve_captcha_confirmed(session, cap, max_images=4):
+def sanitize_code(raw, expect_len=4):
     """
-    加固版识别：拉图 -> ddddocr 识别 -> 生成形近候选 ->
+    清洗 ddddocr 输出：只保留字母数字，去掉混入的汉字/空格/符号。
+    返回恰好 expect_len 位的纯字母数字串；不符合返回 ''。
+    Actions 上 ddddocr 出现过 'CCJ儿'、'cQ/w'、'Ot id' 等脏输出，
+    直接送进 check 全是无效请求，必须先清洗。
+    """
+    if not raw:
+        return ""
+    cleaned = "".join(ch for ch in str(raw) if ch.isascii() and ch.isalnum())
+    return cleaned if len(cleaned) == expect_len else ""
+
+
+def solve_captcha_confirmed(session, cap, max_images=8):
+    """
+    加固版识别：拉图 -> ddddocr 识别 -> 清洗 -> 生成形近候选 ->
     用 action=check 作为"预言机"逐个验证，返回服务端确认正确的 code。
 
     原理（已实测）：
       - action=check 返回 succeed 即代表该 code 与服务端答案一致；
       - 同一张图可以 repeat check（实测不消费验证码），因此可对形近候选逐个试；
       - check 成功还会写入 seccode<idhash> cookie，正是登录提交所需凭据。
-    这样能把 ddddocr 常见的 0/O、1/l 之类的误识纠正回来。
+    针对 Actions 上 ddddocr 输出汉字/符号的问题，识别结果先经 sanitize_code
+    清洗为"恰好 4 位纯字母数字"，脏输出直接换图重识（最多 max_images 张）。
     返回 (code, True)；所有候选都失败返回 (None, False)。
     """
     try:
@@ -421,16 +435,21 @@ def solve_captcha_confirmed(session, cap, max_images=4):
             if r.content[:4] not in (b"\x89PNG", b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1"):
                 print(f"  [验证码] 第 {img_try} 张图返回非图片(可能被拦截)")
                 continue
-            raw = ocr.classification(r.content).strip()
-            if not raw:
+            raw = (ocr.classification(r.content) or "").strip()
+
+            # 关键：清洗脏输出（汉字/空格/符号），只接受 4 位纯字母数字
+            code = sanitize_code(raw)
+            if not code:
+                print(f"  [验证码] 第 {img_try} 张识别结果不合法([{raw}])，换新图 ...")
                 continue
 
-            cands = generate_captcha_candidates(raw)
-            print(f"  [验证码] 识别={raw}，用校验接口确认({len(cands)} 个候选) ...")
+            # 候选：原样 + 形近替换；check 大小写不敏感，故大小写不额外展开
+            cands = generate_captcha_candidates(code)
+            print(f"  [验证码] 识别=[{raw}]->[{code}]，校验接口确认({len(cands)} 个候选) ...")
             for cand in cands:
                 if verify_captcha_code(session, cap, cand):
-                    if cand != raw:
-                        print(f"  [验证码] 形近纠正: {raw} -> {cand}")
+                    if cand != code:
+                        print(f"  [验证码] 形近纠正: {code} -> {cand}")
                     return cand, True
             print(f"  [验证码] 第 {img_try} 张图的候选均未通过校验，换新图 ...")
         except Exception as e:
