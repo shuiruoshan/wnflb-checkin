@@ -558,6 +558,44 @@ def do_login(session, username, password):
     if not formhash or not loginhash:
         return False, "无法解析登录页(formhash/loginhash 缺失)"
 
+    # 路径 A（当前论坛的主要情况）：登录页本身就直接要求验证码。
+    # 风控 IP 下消失的正是这条路径——原脚本一上来就"无验证码提交"，
+    # 服务端直接回"抱歉，验证码填写错误"且不带 auth，于是原逻辑直接失败。
+    # 正确做法：先用 check 预言机识别出被确认的验证码（同时写入 seccode cookie），
+    # 再用标准登录表单带上验证码提交。
+    page_cap = detect_captcha(html)
+    if page_cap["needed"] and page_cap["idhash"]:
+        print("  [登录] 登录页要求验证码，先识别确认 ...")
+        for attempt in range(1, 6):
+            print(f"  [登录] 第 {attempt}/5 轮，验证码 idhash={page_cap['idhash']} ...")
+            code, confirmed = solve_captcha_confirmed(session, page_cap)
+            if not confirmed:
+                print("  [登录] 验证码未通过服务端校验，重新拉登录页 ...")
+                html, formhash, loginhash = fetch_login_page(session)
+                page_cap = detect_captcha(html)
+                if not (formhash and loginhash and page_cap["needed"] and page_cap["idhash"]):
+                    return False, "重新获取登录页失败"
+                continue
+            ok, msg, _ = _submit_login(
+                session, formhash, loginhash, username, password,
+                code, "", page_cap["seccodehash"],
+            )
+            if ok:
+                return True, "登录成功(登录页验证码)"
+            # 验证码这关已过（check 已确认）；失败只可能是密码/账号或频率限制
+            if "验证码" in msg and ("不正确" in msg or "错误" in msg):
+                print(f"  [登录] 第 {attempt} 轮仍提示验证码错误，重新拉登录页 ...")
+                html, formhash, loginhash = fetch_login_page(session)
+                page_cap = detect_captcha(html)
+                continue
+            if "密码" in msg or "用户名" in msg or "尝试" in msg:
+                return False, f"登录失败: {msg}"
+            # 其他情况（如 formhash 失效）重拉登录页
+            html, formhash, loginhash = fetch_login_page(session)
+            page_cap = detect_captcha(html)
+        return False, "登录页验证码重试次数已用尽"
+
+    # 路径 B：登录页未要求验证码，走原来的流程。
     # 首次尝试：无验证码直接提交（老 IP / 已信任环境通常直接成功）
     ok, msg, resp_html = _submit_login(
         session, formhash, loginhash, username, password, None, None
