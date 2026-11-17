@@ -1,8 +1,17 @@
+
+
+我的资料
+wnflb_checkin_fix
+ed.py
+
+
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================================
-# 文件生成 / 最后修改时间：2026-11-17 15:31:02
-# 版本：v4（修复"登录成功页被误判为失败"）
+# 文件生成 / 最后修改时间：2026-11-17 17:50:17
+# 版本：v5（登录成功必须以"多端点确认登录态 + auth Cookie 已下发"为准）
 # 说明：时间戳由 WorkBuddy 在本文件被修改时写入，便于对照 Actions 运行的是哪一版。
 # ============================================================================
 """
@@ -101,17 +110,36 @@ def fetch_forum(session):
 
 # ========================= Cookie 读写 =========================
 
+def _site_host():
+    return urllib.parse.urlsplit(BASE_URL).hostname or "www.wnflb2023.com"
+
+
+def apply_cookie_dict(session, data):
+    """把 name->value 字典写入 session，**绑定到站点域名**。
+
+    为什么不能直接 session.cookies.update(dict)：那样写入的 Cookie domain 为空，
+    会与登录后服务端下发的同名 Cookie（domain=站点）**并存**，请求时两个 auth
+    同时发出，PHP 取到哪一个不确定——旧的那个会让服务端认为"未登录"。
+    这正是「返回登录成功页、紧接着首页却是游客」的典型成因。
+    """
+    host = _site_host()
+    for k, v in (data or {}).items():
+        if not k:
+            continue
+        session.cookies.set(k, v, domain=host, path="/")
+
+
 def load_cookies(session, raw_cookie, cookie_file):
     """把 cookie 载入 session。返回是否成功载入。"""
     if raw_cookie:
-        session.cookies.update(parse_cookies(raw_cookie))
+        apply_cookie_dict(session, parse_cookies(raw_cookie))
         return True
     if cookie_file and os.path.exists(cookie_file):
         try:
             with open(cookie_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict) and data:
-                session.cookies.update(data)
+                apply_cookie_dict(session, data)
                 return True
         except Exception as e:
             print(f"  [Cookie] 读取缓存失败: {e}")
@@ -130,13 +158,94 @@ def save_cookies(session, cookie_file):
         print(f"  [Cookie] 保存失败: {e}")
 
 
+# 不可缓存、且「必须登录才能访问」的探针端点。
+# 为什么不能只看首页：forum.php 常被 CDN / 缓存插件做成「游客缓存」，
+# 已登录也可能拿到游客页（discuz_uid=0），只查首页会把成功登录误判成失败。
+LOGIN_PROBES = (
+    ("首页", FORUM_URL),
+    ("个人中心", BASE_URL + "/home.php?mod=space&do=profile"),
+    ("设置页", BASE_URL + "/home.php?mod=spacecp"),
+)
+
+
+def auth_cookie(session):
+    """返回 (name, value)：Discuz 认证 Cookie（形如 <cookiepre>auth）。
+    排除 invite_auth —— 那是邀请链接的 Cookie，不是登录凭据。"""
+    for c in session.cookies:
+        n = c.name or ""
+        if n.endswith("auth") and "invite" not in n:
+            return n, c.value
+    return None, None
+
+
+def drop_stale_auth(session):
+    """登录前清除可能残留的旧 auth Cookie。
+    失效的 auth 会让服务端进入「疑似已登录」的异常分支，干扰重新登录。"""
+    dropped = []
+    for c in list(session.cookies):
+        n = c.name or ""
+        if n.endswith("auth") and "invite" not in n:
+            try:
+                session.cookies.clear(c.domain, c.path, c.name)
+                dropped.append(n)
+            except Exception:
+                pass
+    if dropped:
+        print(f"  [登录] 已清除失效的认证 Cookie: {', '.join(dropped)}")
+
+
+def probe_login_state(session, verbose=True):
+    """多端点探测登录态：任一端点显示已登录即判定已登录。
+
+    返回 (logged, html, detail)。html 是首页内容（供后续取 formhash 用）。
+    """
+    details = []
+    forum_html = ""
+    for name, url in LOGIN_PROBES:
+        try:
+            r = session.get(url, timeout=TIMEOUT)
+            html = get_page_text(r)
+            if name == "首页":
+                forum_html = html
+            uid = re.search(r"discuz_uid\s*=\s*'(\d+)'", html)
+            ok = check_logged_in(html)
+            uid_txt = uid.group(1) if uid else "未出现"
+            details.append(f"{name}={'已登录' if ok else '游客(uid=' + uid_txt + ')'}")
+            if verbose:
+                print(f"  [登录态] {name} -> {'已登录' if ok else '游客'}"
+                      f"（HTTP {r.status_code}, uid={uid_txt}, 长度 {len(html)}）")
+            if ok:
+                return True, forum_html or html, "; ".join(details)
+        except requests.RequestException as e:
+            details.append(f"{name}=请求失败")
+            if verbose:
+                print(f"  [登录态] {name} -> 请求失败: {e}")
+    return False, forum_html, "; ".join(details)
+
+
+def dump_login_diag(session):
+    """登录态校验失败时输出诊断信息：认证 Cookie 是否下发、各探针端点结果。"""
+    auths = [(c.name, c.domain, c.path, len(c.value or "")) for c in session.cookies
+             if (c.name or "").endswith("auth") and "invite" not in (c.name or "")]
+    print("  [诊断] ======== 登录态校验失败，开始诊断 ========")
+    if auths:
+        for name, dom, path, n in auths:
+            print(f"  [诊断] 认证 Cookie: {name} domain={dom} path={path} 值长度={n}")
+        if len(auths) > 1:
+            print("  [诊断] 警告: 存在多个 auth Cookie（域名不同会导致服务端取错凭据）")
+    else:
+        print("  [诊断] 认证 Cookie: 未下发")
+        print("  [诊断] 说明: 服务端没给出登录凭据，即登录并未真正成功（成功页可能是异常页）")
+    print(f"  [诊断] 当前 Cookie: {', '.join(sorted({c.name for c in session.cookies}))}")
+    probe_login_state(session, verbose=True)
+    print("  [诊断] ========================================")
+
+
 def verify_login(session):
-    """访问论坛首页，判断是否已登录。返回 (bool, html)"""
-    resp = fetch_forum(session)
-    if resp is None:
-        return False, ""
-    html = get_page_text(resp)
-    logged = check_logged_in(html)
+    """确认登录态（多端点）。返回 (bool, html)。"""
+    logged, html, _detail = probe_login_state(session, verbose=False)
+    if not html:
+        html = ""
     return logged, html
 
 
@@ -169,16 +278,24 @@ def _looks_like_js(t):
 
 def extract_message(html):
     """提取 Discuz 提示信息页的正文（登录失败/成功提示、签到提示等）。"""
-    # 方式1: <div id="messagetext"> ... </div>
-    m = re.search(r'id="messagetext"[^>]*>(.*?)</div>\s*</div>', html, re.DOTALL)
+    # 方式1: <div id="messagetext"> 内的 <p> 文案（Discuz 提示页标准结构）
+    m = re.search(r'id="messagetext"[^>]*>(.*?)</div>', html, re.DOTALL)
     if m:
-        t = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+        block = m.group(1)
+        # 先剥掉内联脚本/样式，否则会把 JS 当文案（旧版就是这么把成功页判成失败的）
+        block = re.sub(r"<script.*?</script>", " ", block, flags=re.DOTALL | re.I)
+        block = re.sub(r"<style.*?</style>", " ", block, flags=re.DOTALL | re.I)
+        p = re.search(r"<p[^>]*>(.*?)</p>", block, re.DOTALL)
+        t = re.sub(r"<[^>]+>", " ", p.group(1) if p else block)
+        t = re.sub(r"\s+", " ", t).strip()
         if t and not _looks_like_js(t):
             return t
     # 方式2: 通用 alert 文案 div
     m = re.search(r'class="alert_(?:right|error|info)"[^>]*>(.*?)</div>', html, re.DOTALL)
     if m:
-        t = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+        t = re.sub(r"<script.*?</script>", " ", m.group(1), flags=re.DOTALL | re.I)
+        t = re.sub(r"<[^>]+>", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
         if t and not _looks_like_js(t):
             return t
     return ""
@@ -530,7 +647,8 @@ def refresh_challenge(session, auth, last_html=None):
 
 
 def _submit_login(session, formhash, loginhash, username="", password="",
-                  seccode="", auth="", seccodehash="", challenge=False):
+                  seccode="", auth="", seccodehash="", challenge=False,
+                  inajax=False):
     """
     执行一次登录 POST。返回 (ok, msg, resp_html)。
 
@@ -573,7 +691,7 @@ def _submit_login(session, formhash, loginhash, username="", password="",
         f"{BASE_URL}/member.php?mod=logging&action=login"
         f"&loginsubmit=yes&loginhash={loginhash}"
     )
-    if challenge:
+    if challenge or inajax:
         login_url += "&inajax=1"
     try:
         r = session.post(
@@ -605,34 +723,49 @@ def _submit_login(session, formhash, loginhash, username="", password="",
         "setTimeout(\"window.location.href=",
     )
     if any(mk in txt for mk in _success_markers):
-        # 主动访问首页 + 论坛页，让服务端下发的 auth Cookie 生效并落定，
-        # 避免紧随其后的 verify_login / 签到因登录态尚未生效而误判为未登录。
-        for _u in (BASE_URL + "/", FORUM_URL):
-            try:
-                session.get(_u, timeout=TIMEOUT)
-            except requests.RequestException:
-                pass
-        return True, "登录成功", txt
+        # 关键：页面说"成功" ≠ 真的建立了登录态。
+        # 线上出现过「服务端返回登录成功页，但认证 Cookie 未生效、首页仍是 uid=0」，
+        # 旧逻辑在这里直接 return True，才导致后面报「登录后首页校验未通过」。
+        # 所以必须以探针端点（多端点）确认为准。
+        logged, _html, detail = probe_login_state(session, verbose=False)
+        if logged:
+            print(f"  [登录] 已确认登录态: {detail}")
+            return True, "登录成功", txt
+        print(f"  [登录] 注意: 返回了登录成功页，但会话未建立（{detail}）")
+        return False, "服务端返回了登录成功页，但会话未建立（未下发有效认证 Cookie）", txt
 
     msg = extract_message(txt)
     if not msg:
-        # inajax=1 时消息在 CDATA 里
+        # inajax=1 时消息在 CDATA 里；剥掉内联脚本再取文案
         cdata = re.search(r"<!\[CDATA\[(.*?)\]\]>", txt, re.DOTALL)
         if cdata:
-            msg = re.sub(r"<[^>]+>", "", cdata.group(1)).strip()
+            _blk = re.sub(r"<script.*?</script>", " ", cdata.group(1), flags=re.DOTALL | re.I)
+            msg = re.sub(r"<[^>]+>", " ", _blk)
+            msg = re.sub(r"\s+", " ", msg).strip()
+
+    # ajax(inajax=1) 提交成功信号：Discuz 返回 succeedhandle_login(...)
+    # 浏览器登录表单是 onsubmit="ajaxpost(...)"，ajaxpost 会自动追加 inajax=1，
+    # 这才是真实浏览器提交路径；成功信号明确，不会被提示页 JS 干扰。
+    if "succeedhandle_login" in txt:
+        logged, _html, detail = probe_login_state(session, verbose=False)
+        if logged:
+            print(f"  [登录] 已确认登录态: {detail}")
+            return True, "登录成功", txt
+        print(f"  [登录] 注意: ajax 返回成功回调，但会话未建立（{detail}）")
+        return False, "服务端返回成功回调，但会话未建立（未下发有效认证 Cookie）", txt
 
     # 仍被要求验证码（验证码错误等）
     if "请输入验证码" in txt and "auth=" in txt:
         return False, (msg or "验证码不正确，请重试"), txt
 
-    # 权威校验：访问首页看 discuz_uid 是否为真实 UID
+    # 权威校验：多端点确认登录态
     logged, _ = verify_login(session)
     if logged:
         # 成功页提示区含内联 JS，extract_message 会抽到脏文本，统一用干净文案
         return True, "登录成功", txt
-    # 密码/用户名错误等明确失败
-    if msg and ("密码" in msg or "用户名" in msg):
-        return False, f"登录失败: {msg}", txt
+    # 账号/密码/频率限制等明确的失败文案（避免重复加"登录失败:"前缀）
+    if msg and ("密码" in msg or "用户名" in msg or "尝试" in msg):
+        return False, (msg if msg.startswith("登录失败") else f"登录失败: {msg}"), txt
     return False, (msg or "登录失败（未进入登录态）"), txt
 
 
@@ -659,6 +792,9 @@ def do_login(session, username, password):
     page_cap = detect_captcha(html)
     if page_cap["needed"] and page_cap["idhash"]:
         print("  [登录] 登录页要求验证码，识别后直接提交验证 ...")
+        # 清掉可能残留的旧 auth Cookie：失效的 auth 会让服务端走「疑似已登录」的
+        # 异常分支（返回成功页但不下发新凭据），是本次问题的可疑诱因之一。
+        drop_stale_auth(session)
         last_msg = "登录页验证码重试次数已用尽"
         for attempt in range(1, 7):
             print(f"  [登录] 第 {attempt}/6 轮，验证码 idhash={page_cap['idhash']} ...")
@@ -669,14 +805,29 @@ def do_login(session, username, password):
                 html, formhash, loginhash = fetch_login_page(session)
                 page_cap = detect_captcha(html)
                 continue
-            print(f"  [验证码] 识别=[{code}]，直接提交登录验证 ...")
+            # 两条提交路径交替尝试，互为主备：
+            #   奇数轮 -> ajax(inajax=1)，这是浏览器表单 ajaxpost 的真实路径，
+            #             成功时返回 succeedhandle_login 回调，信号最明确；
+            #   偶数轮 -> 整页提交，返回 Discuz 提示页。
+            # 某条路径在风控下被特殊处理时，另一条仍有机会拿到 auth Cookie。
+            use_ajax = (attempt % 2 == 1)
+            print(f"  [验证码] 识别=[{code}]，直接提交登录验证"
+                  f"（{'ajax' if use_ajax else '整页'}提交）...")
             ok, msg, _ = _submit_login(
                 session, formhash, loginhash, username, password,
-                code, "", page_cap["seccodehash"],
+                code, "", page_cap["seccodehash"], inajax=use_ajax,
             )
             if ok:
                 return True, "登录成功(登录页验证码)"
             last_msg = msg
+            # 页面声称成功但没建立会话 -> 重拉登录页换另一种提交路径
+            if "成功页" in msg or "成功回调" in msg:
+                print(f"  [登录] 第 {attempt} 轮：{msg}，重拉登录页换提交方式 ...")
+                html, formhash, loginhash = fetch_login_page(session)
+                page_cap = detect_captcha(html)
+                if not (formhash and loginhash and page_cap["idhash"]):
+                    return False, "重新获取登录页失败"
+                continue
             # 验证码错误 -> 换全新登录页(idhash+cookie 都刷新)重试
             if "验证码" in msg and ("不正确" in msg or "错误" in msg or "填写" in msg):
                 print(f"  [登录] 第 {attempt} 轮验证码未通过，换新登录页重试 ...")
@@ -950,24 +1101,31 @@ def main():
         ok, msg = do_login(session, args.username, args.password)
         if not ok:
             print(f"[FAIL] 登录失败: {msg}")
+            # 「服务端说成功但会话没建立」这类问题必须留下诊断线索
+            # （认证 Cookie 是否下发 / 各端点 uid），否则无从判断是风控还是账号状态。
+            if "会话未建立" in msg or "成功页" in msg or "成功回调" in msg:
+                dump_login_diag(session)
             send_notification("[签到失败] 登录失败", f"时间:{now}\n错误:{msg}")
             sys.exit(1)
         print(f"  -> {msg}")
         if not args.no_save:
             save_cookies(session, args.cookie_file)
             mark_refreshed()
-        # 登录成功后做登录态确认。Discuz 下发的 auth Cookie 有时存在极短的生效
-        # 延迟，且首页/论坛页可能返回不同的 discuz_uid 渲染，故这里最多重试 3 次
-        # （每次间隔 1.5s），避免偶发误报"登录后首页校验未通过"而直接退出。
-        logged, html = verify_login(session)
+        # 登录成功后再次确认登录态（多端点，任一显示已登录即可）。
+        # 不能只查 forum.php —— 它可能被 CDN/缓存插件做成「游客缓存」，
+        # 已登录也返回 uid=0，只查首页会误判为失败（线上出现过）。
+        logged, html, detail = probe_login_state(session, verbose=True)
         for _try in range(2):
             if logged:
                 break
-            print(f"  [登录] 登录态尚未确认，{1.5}s 后重试校验 ...")
+            print(f"  [登录] 登录态尚未确认（{detail}），1.5s 后重试校验 ...")
             time.sleep(1.5)
-            logged, html = verify_login(session)
+            logged, html, detail = probe_login_state(session, verbose=True)
         if not logged:
-            print("[FAIL] 登录后首页校验未通过")
+            print("[FAIL] 登录后登录态校验未通过")
+            dump_login_diag(session)
+            print("[FAIL] 诊断提示：认证 Cookie 未下发 => 登录未真正成功（服务端仅回了成功页）；"
+                  "Cookie 已下发但仍判游客 => 多为账号状态异常或站点风控。")
             sys.exit(1)
 
     # 3) 签到
@@ -1001,3 +1159,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+Ln 1, Col 1
+行 1152
+Python
+只读
