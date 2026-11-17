@@ -309,22 +309,32 @@ def extract_login_fields(html):
     )
 
 
-def solve_captcha(session, cap):
+def solve_captcha(session, cap, use_ocr_cache=False, max_tries=10):
     """
-    拉取验证码图片并用 ddddocr 识别。
-    多次重试（每次换一张新图），提高识别率。
+    拉取验证码图片并用 ddddocr 识别，清洗为"恰好 4 位纯字母数字"。
+    多次换图重试，直到拿到一个干净的 4 位结果。
     返回识别出的验证码字符串，失败返回 None。
-    """
-    try:
-        import ddddocr  # 仅在需要验证码时才 import
-    except ImportError:
-        print("  [验证码] 未安装 ddddocr，请先 pip install ddddocr")
-        return None
 
-    ocr = ddddocr.DdddOcr(show_ad=False)
+    use_ocr_cache=True 时复用单例 ddddocr（模型加载慢，避免每轮重建）；
+    否则保持旧行为每次新建，兼容旧调用。
+    """
+    if use_ocr_cache:
+        try:
+            ocr = get_ocr()
+        except ImportError:
+            print("  [验证码] 未安装 ddddocr，请先 pip install ddddocr")
+            return None
+    else:
+        try:
+            import ddddocr  # 仅在需要验证码时才 import
+        except ImportError:
+            print("  [验证码] 未安装 ddddocr，请先 pip install ddddocr")
+            return None
+        ocr = ddddocr.DdddOcr(show_ad=False)
+
     # 论坛/WAF 对 seccode 图片接口要求同源 Referer，否则返回 Access Denied
     headers = {"Referer": LOGIN_PAGE_URL}
-    for attempt in range(1, 4):
+    for attempt in range(1, max_tries + 1):
         try:
             update = str(int(time.time() * 1000))
             img_url = (
@@ -339,9 +349,12 @@ def solve_captcha(session, cap):
             if r.content[:4] not in (b"\x89PNG", b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1"):
                 print(f"  [验证码] 第 {attempt} 次返回非图片(可能被拦截), len={len(r.content)}")
                 continue
-            code = ocr.classification(r.content).strip()
+            raw = (ocr.classification(r.content) or "").strip()
+            code = sanitize_code(raw)
             if code:
                 return code
+            # 脏输出（汉字/符号/位数不对）直接换图重识
+            print(f"  [验证码] 识别结果不合法([{raw}])，换新图 ...")
         except Exception as e:
             print(f"  [验证码] 第 {attempt} 次识别异常: {e}")
     return None
@@ -349,10 +362,14 @@ def solve_captcha(session, cap):
 
 def verify_captcha_code(session, cap, code):
     """
-    调用 Discuz 验证码校验接口（action=check）。
-    浏览器在最终提交登录前会先发这个请求：它会校验验证码是否正确，
-    并在 cookie 里写入 seccode<idhash> 标记（登录提交时服务端据此判定验证码已通过）。
-    返回 True/False，仅作提示用，不阻断后续登录提交。
+    调用 Discuz 验证码校验接口（action=check）。仅作"形近纠正"的辅助提示，
+    不作为"是否提交登录"的判据——实测发现：本接口返回 succeed 与最终登录提交
+    是否认可该验证码并不总是完全一致（尤其风控 IP 下），若把它当提交前置条件，
+    会出现"check 通过但提交一直报验证码错误"的死循环。
+
+    真实校验（已实测）：成功返回 <root><![CDATA[succeed]]></root>；
+    错误返回 <root><![CDATA[invalid]]></root>。这里用精确匹配，避免误判。
+    注意：本接口不消费验证码答案，同一张图可重复 check。
     """
     url = (
         f"{BASE_URL}/misc.php?mod=seccode&action=check&inajax=1"
@@ -368,9 +385,12 @@ def verify_captcha_code(session, cap, code):
             },
         )
         txt = get_page_text(r)
-        # 论坛返回 <root><![CDATA[succeed]]></root> 表示验证码正确
-        ok = "succeed" in txt
-        return ok
+        # 精确匹配 succeed，避免把含 "succeed" 的错误页/红包页误判为成功
+        m = re.search(r"<!\[CDATA\[\s*succeed\s*\]\]>", txt)
+        if m:
+            return True
+        # 明确 invalid 或其他 CDATA（如 "1"）都视为未通过
+        return False
     except Exception as e:
         print(f"  [验证码] 校验接口异常: {e}")
         return False
@@ -384,6 +404,12 @@ def get_ocr():
     global _OCR_INSTANCE
     if _OCR_INSTANCE is None:
         import ddddocr
+        try:
+            import importlib.metadata as _md
+            _ver = _md.version("ddddocr")
+        except Exception:
+            _ver = getattr(ddddocr, "__version__", "unknown")
+        print(f"  [验证码] ddddocr 版本={_ver}（推荐 1.6.1；版本差异会影响识别准确率）")
         _OCR_INSTANCE = ddddocr.DdddOcr(show_ad=False)
     return _OCR_INSTANCE
 
@@ -578,41 +604,52 @@ def do_login(session, username, password):
         return False, "无法解析登录页(formhash/loginhash 缺失)"
 
     # 路径 A（当前论坛的主要情况）：登录页本身就直接要求验证码。
-    # 风控 IP 下消失的正是这条路径——原脚本一上来就"无验证码提交"，
-    # 服务端直接回"抱歉，验证码填写错误"且不带 auth，于是原逻辑直接失败。
-    # 正确做法：先用 check 预言机识别出被确认的验证码（同时写入 seccode cookie），
-    # 再用标准登录表单带上验证码提交。
+    # 风控 IP 下，原脚本一上来就"无验证码提交"会被直接回"验证码填写错误"。
+    #
+    # 核心策略（第二代）——以"登录提交结果"为唯一权威，check 仅作辅助：
+    #   上一代把 check(action=check) 当"提交前置预言机"，实测在风控 IP 下会出现
+    #   "check 说 succeed、但提交一直报验证码错误"的死循环（check 的 succeed 与
+    #   服务端登录提交实际认可的结果并不总一致）。因此改为：OCR 识别后直接提交，
+    #   用提交返回的 msg 判断是否真的过了验证码关。
+    #   另外每轮都重新拉登录页（拿全新 idhash + 全新 seccode cookie），避免复用
+    #   旧验证码状态导致重复失败。
     page_cap = detect_captcha(html)
     if page_cap["needed"] and page_cap["idhash"]:
-        print("  [登录] 登录页要求验证码，先识别确认 ...")
-        for attempt in range(1, 6):
-            print(f"  [登录] 第 {attempt}/5 轮，验证码 idhash={page_cap['idhash']} ...")
-            code, confirmed = solve_captcha_confirmed(session, page_cap)
-            if not confirmed:
-                print("  [登录] 验证码未通过服务端校验，重新拉登录页 ...")
+        print("  [登录] 登录页要求验证码，识别后直接提交验证 ...")
+        last_msg = "登录页验证码重试次数已用尽"
+        for attempt in range(1, 7):
+            print(f"  [登录] 第 {attempt}/6 轮，验证码 idhash={page_cap['idhash']} ...")
+            # OCR 识别（清洗为 4 位字母数字；脏输出自动换图）
+            code = solve_captcha(session, page_cap, use_ocr_cache=True)
+            if not code:
+                print("  [登录] 验证码识别失败，重新拉登录页 ...")
                 html, formhash, loginhash = fetch_login_page(session)
                 page_cap = detect_captcha(html)
-                if not (formhash and loginhash and page_cap["needed"] and page_cap["idhash"]):
-                    return False, "重新获取登录页失败"
                 continue
+            print(f"  [验证码] 识别=[{code}]，直接提交登录验证 ...")
             ok, msg, _ = _submit_login(
                 session, formhash, loginhash, username, password,
                 code, "", page_cap["seccodehash"],
             )
             if ok:
                 return True, "登录成功(登录页验证码)"
-            # 验证码这关已过（check 已确认）；失败只可能是密码/账号或频率限制
-            if "验证码" in msg and ("不正确" in msg or "错误" in msg):
-                print(f"  [登录] 第 {attempt} 轮仍提示验证码错误，重新拉登录页 ...")
+            last_msg = msg
+            # 验证码错误 -> 换全新登录页(idhash+cookie 都刷新)重试
+            if "验证码" in msg and ("不正确" in msg or "错误" in msg or "填写" in msg):
+                print(f"  [登录] 第 {attempt} 轮验证码未通过，换新登录页重试 ...")
                 html, formhash, loginhash = fetch_login_page(session)
                 page_cap = detect_captcha(html)
+                if not (formhash and loginhash and page_cap["idhash"]):
+                    return False, "重新获取登录页失败"
                 continue
+            # 明确的账号/密码/频率问题 -> 验证码关已过，直接返回
+            # 注意 msg 可能已含"登录失败:"前缀（来自 _submit_login），避免重复
             if "密码" in msg or "用户名" in msg or "尝试" in msg:
-                return False, f"登录失败: {msg}"
-            # 其他情况（如 formhash 失效）重拉登录页
+                return False, msg if msg.startswith("登录失败") else f"登录失败: {msg}"
+            # 其他（formhash 失效等）重拉登录页再试
             html, formhash, loginhash = fetch_login_page(session)
             page_cap = detect_captcha(html)
-        return False, "登录页验证码重试次数已用尽"
+        return False, last_msg
 
     # 路径 B：登录页未要求验证码，走原来的流程。
     # 首次尝试：无验证码直接提交（老 IP / 已信任环境通常直接成功）
@@ -659,23 +696,23 @@ def do_login(session, username, password):
         return False, f"验证码挑战页未解析出验证码(idhash 缺失): {msg}"
 
     # 二次挑战提交（不带账号密码，凭据由 auth 关联）。
-    # 加固点：
-    #   1) 用 solve_captcha_confirmed 校验形近候选，确保提交的 code 已被服务端确认；
-    #   2) 每次失败（验证码错 / auth 失效）都重拉挑战页刷新 auth，避免用旧令牌重试；
-    #   3) 最多 5 轮，auth 换新但总尝试可控。
+    # 与路径 A 一致：以"提交结果"为唯一权威，不再拿 check 当提交前置条件
+    # （风控 IP 下 check 的 succeed 与登录提交认可结果可能不一致，会造成死循环）。
+    # 每轮都刷新挑战页拿新 auth + 新验证码状态，最多 6 轮。
     last_msg = "验证码识别失败"
-    for attempt in range(1, 6):
-        print(f"  [登录] 第 {attempt}/5 轮，验证码 idhash={cap['idhash']} ...")
+    for attempt in range(1, 7):
+        print(f"  [登录] 第 {attempt}/6 轮，验证码 idhash={cap['idhash']} ...")
 
-        # 识别 + 形近纠正 + check 预言机确认（内部会换图重试）
-        code, confirmed = solve_captcha_confirmed(session, cap)
-        if not confirmed:
-            last_msg = "验证码识别失败（候选均未通过服务端校验）"
+        # 仅做 OCR 识别（复用实例 + 清洗 + 换图），不经过 check 判断
+        code = solve_captcha(session, cap, use_ocr_cache=True)
+        if not code:
+            last_msg = "验证码识别失败（未能得到 4 位识别结果）"
             print(f"  [登录] {last_msg}，刷新挑战页后重试 ...")
             refreshed = refresh_challenge(session, auth)
             if refreshed:
                 c_fh, c_lh, auth, cap = refreshed
             continue
+        print(f"  [验证码] 识别=[{code}]，直接提交验证 ...")
 
         ok2, last_msg, resp2 = _submit_login(
             session, c_fh, c_lh, username, password, code, auth,
@@ -685,7 +722,7 @@ def do_login(session, username, password):
             return True, "登录成功(已通过验证码)"
 
         # 验证码不正确 或 凭据(auth)失效：统一刷新挑战页拿新 auth 再重试
-        if ("验证码" in last_msg and ("不正确" in last_msg or "错误" in last_msg)) \
+        if ("验证码" in last_msg and ("不正确" in last_msg or "错误" in last_msg or "填写" in last_msg)) \
                 or "密码" in last_msg or "用户名" in last_msg:
             print(f"  [登录] 第 {attempt} 轮提交失败({last_msg})，重拉挑战页刷新 auth ...")
             refreshed = refresh_challenge(session, auth, resp2)
