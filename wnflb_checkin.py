@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# ============================================================================
+# 文件生成 / 最后修改时间：2026-11-17 15:31:02
+# 版本：v4（修复"登录成功页被误判为失败"）
+# 说明：时间戳由 WorkBuddy 在本文件被修改时写入，便于对照 Actions 运行的是哪一版。
+# ============================================================================
 """
 福利吧论坛 (wnflb2023.com) 自动签到脚本
 =======================================
@@ -153,18 +158,29 @@ def check_logged_in(html):
     return False
 
 
+def _looks_like_js(t):
+    """判断抓到的"文案"是否其实是内联 JS（Discuz 成功/跳转页常见），
+    这类文本不是给人看的错误消息，必须剔除，否则会被当成错误原因输出。"""
+    if not t:
+        return True
+    js_marks = ("$(", "function(", "window.location", "setTimeout", "document.write", "innerHTML", "getElementById", ".style.display")
+    return any(k in t for k in js_marks)
+
+
 def extract_message(html):
     """提取 Discuz 提示信息页的正文（登录失败/成功提示、签到提示等）。"""
     # 方式1: <div id="messagetext"> ... </div>
     m = re.search(r'id="messagetext"[^>]*>(.*?)</div>\s*</div>', html, re.DOTALL)
     if m:
         t = re.sub(r"<[^>]+>", "", m.group(1)).strip()
-        if t:
+        if t and not _looks_like_js(t):
             return t
     # 方式2: 通用 alert 文案 div
     m = re.search(r'class="alert_(?:right|error|info)"[^>]*>(.*?)</div>', html, re.DOTALL)
     if m:
-        return re.sub(r"<[^>]+>", "", m.group(1)).strip()
+        t = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+        if t and not _looks_like_js(t):
+            return t
     return ""
 
 
@@ -571,6 +587,33 @@ def _submit_login(session, formhash, loginhash, username="", password="",
         return False, f"登录请求异常: {e}", ""
 
     txt = get_page_text(r)
+
+    # ---- 最高优先级：识别 Discuz「登录成功页」 ----
+    # 此前版本把登录成功页误判为失败：服务端登录成功后返回的是带 JS 的跳转页，
+    # 形如：
+    #   if($('succeedmessage')) {$('succeedmessage').innerHTML = '';}
+    #   $('main_message').style.display = 'none';
+    #   $('main_success').style.display = '';
+    #   $('succeedlocation').innerHTML = '...';      // 含欢迎语/用户名
+    #   setTimeout("window.location.href='https://.../?'", 3000);
+    # 判据必须用「JS 调用形式」，不能只查 id 名——因为登录页模板里本来就预置了
+    # 空的 <p id="succeedmessage"></p>/<p id="succeedlocation"></p> 占位元素，
+    # 只查 id 名会把登录页/失败页误判成功（已实测）。故匹配带 $('...') 的调用。
+    _success_markers = (
+        "$('succeedmessage').innerHTML",
+        "$('main_success').style.display",
+        "setTimeout(\"window.location.href=",
+    )
+    if any(mk in txt for mk in _success_markers):
+        # 主动访问首页 + 论坛页，让服务端下发的 auth Cookie 生效并落定，
+        # 避免紧随其后的 verify_login / 签到因登录态尚未生效而误判为未登录。
+        for _u in (BASE_URL + "/", FORUM_URL):
+            try:
+                session.get(_u, timeout=TIMEOUT)
+            except requests.RequestException:
+                pass
+        return True, "登录成功", txt
+
     msg = extract_message(txt)
     if not msg:
         # inajax=1 时消息在 CDATA 里
@@ -913,7 +956,16 @@ def main():
         if not args.no_save:
             save_cookies(session, args.cookie_file)
             mark_refreshed()
+        # 登录成功后做登录态确认。Discuz 下发的 auth Cookie 有时存在极短的生效
+        # 延迟，且首页/论坛页可能返回不同的 discuz_uid 渲染，故这里最多重试 3 次
+        # （每次间隔 1.5s），避免偶发误报"登录后首页校验未通过"而直接退出。
         logged, html = verify_login(session)
+        for _try in range(2):
+            if logged:
+                break
+            print(f"  [登录] 登录态尚未确认，{1.5}s 后重试校验 ...")
+            time.sleep(1.5)
+            logged, html = verify_login(session)
         if not logged:
             print("[FAIL] 登录后首页校验未通过")
             sys.exit(1)
