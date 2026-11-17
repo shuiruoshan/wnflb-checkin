@@ -1,12 +1,3 @@
-
-
-我的资料
-wnflb_checkin_fix
-ed.py
-
-
-
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================================
@@ -1159,7 +1150,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-Ln 1, Col 1
-行 1152
-Python
-只读
