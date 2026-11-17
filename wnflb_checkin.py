@@ -168,6 +168,61 @@ def extract_message(html):
     return ""
 
 
+# ========================= 验证码形近字符纠正 =========================
+
+# ddddocr 最容易混淆的字符对。check 接口经实测大小写不敏感，
+# 故这里只处理"数字/字母形近"，不做大小写变体。
+CONFUSABLES = {
+    "0": ["O", "D"], "O": ["0", "D"], "D": ["0", "O"],
+    "1": ["l", "I", "7"], "l": ["1", "I"], "I": ["1", "l"], "7": ["1"],
+    "5": ["S"], "S": ["5"],
+    "8": ["B"], "B": ["8"],
+    "2": ["Z"], "Z": ["2"],
+    "6": ["G"], "G": ["6"],
+    "9": ["g", "q"], "g": ["9", "q"], "q": ["9", "g"],
+    "3": ["E"], "E": ["3"],
+    "4": ["A"], "A": ["4"],
+}
+
+
+def generate_captcha_candidates(code, max_total=40):
+    """
+    根据 ddddocr 的识别结果生成形近候选，按"改动字符数"升序排列：
+      1) 原样
+      2) 单个字符替换（最常见：ddddocr 只错 1 位）
+      3) 两个字符同时替换（限量，避免组合爆炸）
+    """
+    code = (code or "").strip()
+    if not code:
+        return []
+    out, seen = [], set()
+
+    def add(c):
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+
+    add(code)
+    # 单字符替换
+    for i, ch in enumerate(code):
+        for alt in CONFUSABLES.get(ch, []):
+            add(code[:i] + alt + code[i + 1:])
+    # 双字符替换（限量）
+    if len(out) < max_total:
+        pos = [i for i, ch in enumerate(code) if ch in CONFUSABLES]
+        for a in range(len(pos)):
+            for b in range(a + 1, len(pos)):
+                i, j = pos[a], pos[b]
+                for ai in CONFUSABLES[code[i]]:
+                    for bj in CONFUSABLES[code[j]]:
+                        chars = list(code)
+                        chars[i], chars[j] = ai, bj
+                        add("".join(chars))
+                        if len(out) >= max_total:
+                            return out
+    return out[:max_total]
+
+
 # ========================= 登录（账号密码） =========================
 
 def fetch_login_page(session):
@@ -321,6 +376,98 @@ def verify_captcha_code(session, cap, code):
         return False
 
 
+_OCR_INSTANCE = None
+
+
+def get_ocr():
+    """复用单个 ddddocr 实例（模型加载较慢，避免每次识别都重建）。"""
+    global _OCR_INSTANCE
+    if _OCR_INSTANCE is None:
+        import ddddocr
+        _OCR_INSTANCE = ddddocr.DdddOcr(show_ad=False)
+    return _OCR_INSTANCE
+
+
+def solve_captcha_confirmed(session, cap, max_images=4):
+    """
+    加固版识别：拉图 -> ddddocr 识别 -> 生成形近候选 ->
+    用 action=check 作为"预言机"逐个验证，返回服务端确认正确的 code。
+
+    原理（已实测）：
+      - action=check 返回 succeed 即代表该 code 与服务端答案一致；
+      - 同一张图可以 repeat check（实测不消费验证码），因此可对形近候选逐个试；
+      - check 成功还会写入 seccode<idhash> cookie，正是登录提交所需凭据。
+    这样能把 ddddocr 常见的 0/O、1/l 之类的误识纠正回来。
+    返回 (code, True)；所有候选都失败返回 (None, False)。
+    """
+    try:
+        ocr = get_ocr()
+    except ImportError:
+        print("  [验证码] 未安装 ddddocr，请先 pip install ddddocr")
+        return None, False
+
+    headers = {"Referer": LOGIN_PAGE_URL}
+    for img_try in range(1, max_images + 1):
+        try:
+            update = str(int(time.time() * 1000))
+            img_url = (
+                f"{BASE_URL}/misc.php?mod=seccode"
+                f"&update={update}&idhash={cap['idhash']}"
+            )
+            r = session.get(img_url, timeout=TIMEOUT, headers=headers)
+            if r.status_code != 200 or len(r.content) < 100:
+                print(f"  [验证码] 第 {img_try} 张图拉取失败(status={r.status_code}, len={len(r.content)})")
+                continue
+            if r.content[:4] not in (b"\x89PNG", b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1"):
+                print(f"  [验证码] 第 {img_try} 张图返回非图片(可能被拦截)")
+                continue
+            raw = ocr.classification(r.content).strip()
+            if not raw:
+                continue
+
+            cands = generate_captcha_candidates(raw)
+            print(f"  [验证码] 识别={raw}，用校验接口确认({len(cands)} 个候选) ...")
+            for cand in cands:
+                if verify_captcha_code(session, cap, cand):
+                    if cand != raw:
+                        print(f"  [验证码] 形近纠正: {raw} -> {cand}")
+                    return cand, True
+            print(f"  [验证码] 第 {img_try} 张图的候选均未通过校验，换新图 ...")
+        except Exception as e:
+            print(f"  [验证码] 第 {img_try} 次处理异常: {e}")
+    return None, False
+
+
+def refresh_challenge(session, auth, last_html=None):
+    """
+    重新拉取二次验证码挑战页，取得新的 auth 与验证码参数。
+    auth 令牌在提交失败后可能已失效，必须刷新，否则重试必然再次失败。
+    优先从最近一次响应 HTML 中解析（Discuz 失败响应常直接带新挑战页），
+    否则带旧 auth GET 挑战页。
+    返回 (formhash, loginhash, new_auth, cap) 或 None。
+    """
+    chtml = last_html or ""
+    c_fh, c_lh, c_auth = extract_login_fields(chtml)
+    cap = detect_captcha(chtml)
+    new_auth = urllib.parse.unquote(c_auth) if c_auth else None
+    if not (new_auth and c_fh and c_lh and cap["needed"] and cap["idhash"]):
+        try:
+            r = session.get(
+                f"{BASE_URL}/member.php",
+                params={"mod": "logging", "action": "login", "auth": auth},
+                timeout=TIMEOUT, headers={"Referer": LOGIN_PAGE_URL},
+            )
+            chtml = get_page_text(r)
+            c_fh, c_lh, c_auth = extract_login_fields(chtml)
+            new_auth = urllib.parse.unquote(c_auth) if c_auth else auth
+            cap = detect_captcha(chtml)
+        except requests.RequestException:
+            return None
+    if not (c_fh and c_lh and cap["needed"] and cap["idhash"]):
+        return None
+    return c_fh, c_lh, new_auth, cap
+
+
 def _submit_login(session, formhash, loginhash, username="", password="",
                   seccode="", auth="", seccodehash="", challenge=False):
     """
@@ -454,45 +601,39 @@ def do_login(session, username, password):
     if not cap["needed"] or not cap["idhash"]:
         return False, f"验证码挑战页未解析出验证码(idhash 缺失): {msg}"
 
-    # 二次挑战提交（不带账号密码，凭据由 auth 关联）。最多 3 次换图重试；
-    # 若仍报凭据缺失（auth 失效 / 编码问题），则重拉挑战页拿新 auth 再试。
+    # 二次挑战提交（不带账号密码，凭据由 auth 关联）。
+    # 加固点：
+    #   1) 用 solve_captcha_confirmed 校验形近候选，确保提交的 code 已被服务端确认；
+    #   2) 每次失败（验证码错 / auth 失效）都重拉挑战页刷新 auth，避免用旧令牌重试；
+    #   3) 最多 5 轮，auth 换新但总尝试可控。
     last_msg = "验证码识别失败"
-    for attempt in range(1, 4):
-        print(f"  [登录] 验证码 idhash={cap['idhash']}，ddddocr 识别中(第{attempt}次) ...")
-        code = solve_captcha(session, cap)
-        if not code:
-            return False, "验证码识别失败，请检查 ddddocr 或手动处理"
+    for attempt in range(1, 6):
+        print(f"  [登录] 第 {attempt}/5 轮，验证码 idhash={cap['idhash']} ...")
 
-        # 调用验证码校验接口（设置 seccode cookie，确认识别是否正确）
-        if not verify_captcha_code(session, cap, code):
-            print(f"  [登录] 第 {attempt} 次验证码校验未通过，换新图重试 ...")
+        # 识别 + 形近纠正 + check 预言机确认（内部会换图重试）
+        code, confirmed = solve_captcha_confirmed(session, cap)
+        if not confirmed:
+            last_msg = "验证码识别失败（候选均未通过服务端校验）"
+            print(f"  [登录] {last_msg}，刷新挑战页后重试 ...")
+            refreshed = refresh_challenge(session, auth)
+            if refreshed:
+                c_fh, c_lh, auth, cap = refreshed
             continue
 
-        ok2, last_msg, _ = _submit_login(
+        ok2, last_msg, resp2 = _submit_login(
             session, c_fh, c_lh, username, password, code, auth,
             cap["seccodehash"], challenge=True,
         )
         if ok2:
             return True, "登录成功(已通过验证码)"
-        # 验证码不正确则换新图重试
-        if "验证码" in last_msg and ("不正确" in last_msg or "错误" in last_msg):
-            print(f"  [登录] 第 {attempt} 次验证码不正确，换新图重试 ...")
-            continue
-        # 凭据缺失（auth 失效）：重拉挑战页获取新 auth 重试一次
-        if "密码" in last_msg or "用户名" in last_msg:
-            print(f"  [登录] 第 {attempt} 次疑似凭据缺失，重拉挑战页重试 ...")
-            try:
-                r = session.get(
-                    f"{BASE_URL}/member.php",
-                    params={"mod": "logging", "action": "login", "auth": auth},
-                    timeout=TIMEOUT, headers={"Referer": LOGIN_PAGE_URL},
-                )
-                chtml = get_page_text(r)
-                c_fh, c_lh, c_auth = extract_login_fields(chtml)
-                auth = urllib.parse.unquote(c_auth) if c_auth else auth
-                cap = detect_captcha(chtml)
-            except requests.RequestException:
-                pass
+
+        # 验证码不正确 或 凭据(auth)失效：统一刷新挑战页拿新 auth 再重试
+        if ("验证码" in last_msg and ("不正确" in last_msg or "错误" in last_msg)) \
+                or "密码" in last_msg or "用户名" in last_msg:
+            print(f"  [登录] 第 {attempt} 轮提交失败({last_msg})，重拉挑战页刷新 auth ...")
+            refreshed = refresh_challenge(session, auth, resp2)
+            if refreshed:
+                c_fh, c_lh, auth, cap = refreshed
             continue
         # 其他失败不再重试
         return False, last_msg
